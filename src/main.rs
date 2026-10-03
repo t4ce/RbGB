@@ -2,6 +2,7 @@
 
 extern crate alloc;
 
+mod audio;
 mod commands;
 mod view;
 
@@ -15,7 +16,8 @@ use trueos::ui4_scene::{
 use trueos::{async_fs, clock, env, logl, vshell, vsys};
 use view::{HEIGHT, View, WIDTH};
 
-const FRAME_MS: u64 = 17;
+// Native LCD cadence (59.7275 Hz), also keeps 48 kHz PCM in time.
+const FRAME_NS: u64 = (70224 * 1_000_000_000 + 2_097_152) / 4_194_304;
 const SPRITE_ID: u32 = 1;
 
 fn main() {
@@ -54,10 +56,14 @@ fn run() -> Result<(), String> {
     let mut shell = LineInput::new();
     let mut uploaded = false;
     let mut pending_resize = None;
+    let mut audio = audio::AudioOutput::new();
+    let mut deadline = clock::monotonic_nanos();
 
     loop {
-        let started = clock::monotonic_millis();
         let loaded = poll_commands(&mut shell, &mut emulator, &directory);
+        if loaded {
+            audio.reset();
+        }
         let ui_work = (|| {
             while let Some(event) = frame.take_resize_event()? {
                 // A native pixel is the minimum; never crop or shrink the LCD.
@@ -86,6 +92,7 @@ fn run() -> Result<(), String> {
 
         let running = !emulator.is_paused();
         emulator.update();
+        audio.pump(&mut emulator);
 
         if !uploaded || loaded || running {
             if let Err(error) = retry_busy(|| {
@@ -100,9 +107,14 @@ fn run() -> Result<(), String> {
         }
 
         vsys::poll_once();
-        let remaining = FRAME_MS.saturating_sub(clock::monotonic_millis() - started);
+        deadline = deadline.saturating_add(FRAME_NS);
+        let now = clock::monotonic_nanos();
+        if now > deadline.saturating_add(FRAME_NS) {
+            deadline = now;
+        }
+        let remaining = deadline.saturating_sub(now);
         if remaining > 0 {
-            vsys::sleep_ms(remaining);
+            vsys::sleep_ms(remaining.div_ceil(1_000_000));
         }
     }
 }
@@ -214,13 +226,9 @@ fn load_rom(emulator: &mut Emulator, directory: &str, name: &str) -> Result<(), 
     if !(0x150..=MAX_ROM_SIZE).contains(&rom.len()) {
         return Err(format!("unsupported ROM size: {} bytes", rom.len()));
     }
-    if rom[0x143] & 0xC0 == 0xC0 {
-        vshell::line(
-            "This cartridge requires Game Boy Color; CGB hardware emulation is not implemented yet.",
-        );
-    }
     emulator.load_rom_data(&rom);
-    vshell::linef(format_args!("Loaded {name} ({} bytes)", rom.len()));
+    let mode = if emulator.is_cgb() { "CGB" } else { "DMG" };
+    vshell::linef(format_args!("Loaded {name} ({} bytes; {mode})", rom.len()));
     Ok(())
 }
 
