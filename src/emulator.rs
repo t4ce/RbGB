@@ -1,6 +1,7 @@
 use crate::types::{GameInput, KeyState};
 
 mod cpu;
+mod cgb;
 mod graphics;
 mod joypad;
 mod mem;

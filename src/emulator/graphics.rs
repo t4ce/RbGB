@@ -1,338 +1,173 @@
-use crate::emulator::mem::*;
+use crate::emulator::mem::Memory;
 use crate::types::*;
 
-/// Basic implementation and methods for the LCD Screen
+/// Scanline renderer. DMG and CGB share LCD timing and the RGBA output.
 pub struct Screen {
-    scanline_counter: i32,
-
-    // Packed, row-major RGBA8; every pixel has opaque alpha.
+    dots: u32,
+    window_line: u8,
+    lcd_enabled: bool,
+    stat_line: bool,
+    bg_colors: [u8; 160],
+    bg_priority: [bool; 160],
     pub buffer: LCD,
 }
 
 impl Screen {
     pub fn new() -> Self {
         let mut buffer = [0; (SCREEN_HEIGHT * SCREEN_WIDTH * 4) as usize];
-        for pixel in buffer.chunks_exact_mut(4) {
-            pixel[3] = 255;
-        }
-        Screen {
-            buffer,
-
-            scanline_counter: 456,
-        }
+        for pixel in buffer.chunks_exact_mut(4) { pixel[3] = 255; }
+        Self { dots: 0, window_line: 0, lcd_enabled: false, stat_line: false,
+            bg_colors: [0; 160], bg_priority: [false; 160], buffer }
     }
 
     pub fn update_screen(&mut self, mem: &mut Memory, cycles: i32) {
-        self.set_lcd_status(mem);
-
-        if self.is_lcd_enabled(mem) {
-            self.scanline_counter -= cycles;
-        } else {
-            // LCD is not enabled so do nothing
+        if !self.is_lcd_enabled(mem) {
+            self.dots = 0;
+            self.window_line = 0;
+            self.lcd_enabled = false;
+            mem.write_byte_forced(CURRENT_SCANLINE, 0);
+            self.set_lcd_status(mem);
             return;
         }
-
-        if self.scanline_counter <= 0 {
-            // Time to move onto the next scanline
-            let scanline = mem.read_byte(CURRENT_SCANLINE).wrapping_add(1);
-            mem.write_byte_forced(CURRENT_SCANLINE, scanline);
-
-            self.scanline_counter = 456;
-
-            // we are now in the vertical blank period
-            if scanline == 144 {
-                mem.request_interrupt(0);
-            }
-            // If we are past 153, we reset to 0
-            else if scanline > 153 {
-                mem.write_byte_forced(CURRENT_SCANLINE, 0);
-            }
-            // Otherwise we draw the current line
-            else if scanline < 144 {
+        if !self.lcd_enabled {
+            self.lcd_enabled = true;
+            self.dots = 0;
+            self.window_line = 0;
+        }
+        let mut remaining = cycles as u32;
+        while remaining != 0 {
+            let line = mem.read_byte(CURRENT_SCANLINE);
+            let boundary = if line >= 144 { 456 } else if self.dots < 80 { 80 }
+                else if self.dots < 252 { 252 } else { 456 };
+            let advance = remaining.min(boundary - self.dots);
+            self.dots += advance;
+            remaining -= advance;
+            if self.dots == 252 && line < 144 {
                 self.draw_scanline(mem);
+                mem.hblank_dma();
             }
+            if self.dots == 456 {
+                self.dots = 0;
+                let next = if line == 153 { 0 } else { line + 1 };
+                mem.write_byte_forced(CURRENT_SCANLINE, next);
+                if next == 144 { mem.request_interrupt(0); }
+                if next == 0 { self.window_line = 0; }
+            }
+            self.set_lcd_status(mem);
         }
     }
 
     fn draw_scanline(&mut self, mem: &Memory) {
         let control = mem.read_byte(LCD_CONTROL);
-
-        if control & (1 << 7) != 0 {
-            if control & 0x1 != 0 {
-                self.render_tiles(mem, control);
-            }
-
-            if control & 0x2 != 0 {
-                self.render_sprites(mem, control);
-            }
-        }
+        self.render_tiles(mem, control);
+        if control & 2 != 0 { self.render_sprites(mem, control); }
     }
 
-    fn render_tiles(&mut self, mem: &Memory, control: Byte) {
-        let mut unsigned = true;
-        let tile_data = if control & (1 << 4) != 0 {
-            0x8000
-        } else {
-            unsigned = false;
-            0x8800
-        };
-
-        // where to draw the visual area and the window
-        let scroll_y = mem.read_byte(0xFF42);
-        let scroll_x = mem.read_byte(0xFF43);
-        let window_y = mem.read_byte(0xFF4A);
-        let window_x = mem.read_byte(0xFF4B).wrapping_sub(7);
-        let current_line = mem.read_byte(CURRENT_SCANLINE);
-        let using_window = (control & (1 << 5) != 0) && window_y <= current_line;
-
-        // determine which tile map to use
-        let background_memory: Word = if using_window {
-            if control & (1 << 6) != 0 {
-                0x9C00
+    fn render_tiles(&mut self, mem: &Memory, control: u8) {
+        let line = mem.read_byte(CURRENT_SCANLINE);
+        let cgb = mem.cgb_mode();
+        let wx = i16::from(mem.read_byte(0xFF4B)) - 7;
+        let wy = mem.read_byte(0xFF4A);
+        let window = control & 0x20 != 0 && line >= wy && wx < 160 && (cgb || control & 1 != 0);
+        let mut window_drawn = false;
+        for x in 0..160usize {
+            let in_window = window && x as i16 >= wx;
+            let (px, py, map) = if in_window {
+                window_drawn = true;
+                ((x as i16 - wx) as u8, self.window_line, if control & 0x40 != 0 { 0x9C00 } else { 0x9800 })
             } else {
-                0x9800
-            }
-        } else if control & (1 << 3) != 0 {
-            0x9C00
-        } else {
-            0x9800
-        };
-
-        let y_pos = if using_window {
-            current_line.wrapping_sub(window_y)
-        } else {
-            scroll_y.wrapping_add(current_line)
-        };
-
-        let tile_row: Word = ((y_pos / 8) as Word) * 32;
-
-        for pixel in 0..SCREEN_WIDTH as Byte {
-            let mut x_pos = pixel.wrapping_add(scroll_x);
-            if using_window && pixel >= window_x {
-                x_pos = pixel.wrapping_sub(window_x);
-            }
-
-            let tile_column = (x_pos / 8) as Word;
-            let tile_num = mem.read_byte(background_memory + tile_row + tile_column);
-
-            let mut tile_location: Word = tile_data;
-            if unsigned {
-                tile_location += tile_num as Word * 16;
-            } else {
-                let signed = tile_num as i8 as i16;
-                tile_location += ((signed + 128) as Word) * 16;
-            }
-
-            let line = (y_pos % 8) * 2;
-            let data1 = mem.read_byte(tile_location + line as Word);
-            let data2 = mem.read_byte(tile_location + line as Word + 1);
-
-            let color_bit = 7 - (x_pos % 8);
-            let color_num = (((data2 >> color_bit) & 1) << 1) | ((data1 >> color_bit) & 1);
-
-            let color: Color = mem.get_color(color_num, 0xFF47).unwrap_or(Color::Black);
-            let (red, green, blue) = match color {
-                Color::White => (255, 255, 255),
-                Color::LightGrey => (0xCC, 0xCC, 0xCC),
-                Color::DarkGrey => (0x77, 0x77, 0x77),
-                Color::Black => (0, 0, 0),
+                ((x as u8).wrapping_add(mem.read_byte(0xFF43)), line.wrapping_add(mem.read_byte(0xFF42)),
+                    if control & 8 != 0 { 0x9C00 } else { 0x9800 })
             };
+            let map_addr = map + u16::from(py / 8) * 32 + u16::from(px / 8);
+            let tile = mem.read_vram(map_addr, 0);
+            let attrs = if cgb { mem.read_vram(map_addr, 1) } else { 0 };
+            let row = if attrs & 0x40 != 0 { 7 - (py & 7) } else { py & 7 };
+            let tile_addr = if control & 0x10 != 0 { 0x8000 + u16::from(tile) * 16 }
+                else { (0x9000i32 + i32::from(tile as i8) * 16) as u16 };
+            let lo = mem.read_vram(tile_addr + u16::from(row) * 2, (attrs >> 3) & 1);
+            let hi = mem.read_vram(tile_addr + u16::from(row) * 2 + 1, (attrs >> 3) & 1);
+            let bit = if attrs & 0x20 != 0 { px & 7 } else { 7 - (px & 7) };
+            let color = if !cgb && control & 1 == 0 { 0 } else { ((lo >> bit) & 1) | (((hi >> bit) & 1) << 1) };
+            self.bg_colors[x] = color;
+            self.bg_priority[x] = attrs & 0x80 != 0;
+            let rgba = if cgb { mem.cgb_color(false, attrs & 7, color) } else {
+                Self::dmg_color(mem.read_byte(0xFF47), color)
+            };
+            let index = (line as usize * 160 + x) * 4;
+            self.buffer[index..index + 4].copy_from_slice(&rgba);
+        }
+        if window_drawn { self.window_line = self.window_line.wrapping_add(1); }
+    }
 
-            if current_line as usize >= SCREEN_HEIGHT as usize
-                || pixel as usize >= SCREEN_WIDTH as usize
-            {
-                continue;
+    fn render_sprites(&mut self, mem: &Memory, control: u8) {
+        let line = i16::from(mem.read_byte(CURRENT_SCANLINE));
+        let height = if control & 4 != 0 { 16 } else { 8 };
+        let cgb = mem.cgb_mode();
+        let mut sprites = [(0u8, 0u8); 10];
+        let mut count = 0;
+        for i in 0..40u16 {
+            let y = i16::from(mem.read_byte(0xFE00 + i * 4)) - 16;
+            if line >= y && line < y + height {
+                sprites[count] = (mem.read_byte(0xFE01 + i * 4), i as u8);
+                count += 1;
+                if count == 10 { break; }
             }
-
-            let idx = (current_line as usize * SCREEN_WIDTH as usize + pixel as usize) * 4;
-            self.buffer[idx..idx + 4].copy_from_slice(&[red, green, blue, 255]);
+        }
+        if !cgb { sprites[..count].sort_unstable(); }
+        let mut claimed = [false; 160];
+        for &(_, sprite) in &sprites[..count] {
+            let addr = 0xFE00 + u16::from(sprite) * 4;
+            let y = i16::from(mem.read_byte(addr)) - 16;
+            let x = i16::from(mem.read_byte(addr + 1)) - 8;
+            let attrs = mem.read_byte(addr + 3);
+            let mut row = line - y;
+            if attrs & 0x40 != 0 { row = height - 1 - row; }
+            let tile = mem.read_byte(addr + 2) & if height == 16 { 0xFE } else { 0xFF };
+            let data = 0x8000 + u16::from(tile) * 16 + row as u16 * 2;
+            let bank = if cgb { (attrs >> 3) & 1 } else { 0 };
+            let lo = mem.read_vram(data, bank);
+            let hi = mem.read_vram(data + 1, bank);
+            for pixel in 0..8 {
+                let pos = x + pixel;
+                if !(0..160).contains(&pos) || claimed[pos as usize] { continue; }
+                let bit = if attrs & 0x20 != 0 { pixel } else { 7 - pixel };
+                let color = ((lo >> bit) & 1) | (((hi >> bit) & 1) << 1);
+                if color == 0 { continue; }
+                claimed[pos as usize] = true;
+                let bg_nonzero = self.bg_colors[pos as usize] != 0;
+                let behind = attrs & 0x80 != 0 || (cgb && self.bg_priority[pos as usize]);
+                if bg_nonzero && behind && (!cgb || control & 1 != 0) { continue; }
+                let rgba = if cgb { mem.cgb_color(true, attrs & 7, color) } else {
+                    Self::dmg_color(mem.read_byte(if attrs & 0x10 != 0 { 0xFF49 } else { 0xFF48 }), color)
+                };
+                let index = (line as usize * 160 + pos as usize) * 4;
+                self.buffer[index..index + 4].copy_from_slice(&rgba);
+            }
         }
     }
 
-    fn render_sprites(&mut self, mem: &Memory, control: Byte) {
-        // test if display is enabled
-        if control & 0x2 != 0 {
-            let mut use8x16 = false;
-            if control & 0x4 != 0 {
-                use8x16 = true;
-            }
-
-            for sprite in 0..40 {
-                let index = sprite * 4;
-                let y_pos = mem.read_byte(0xFE00 + index) as i32 - 16;
-                let x_pos = mem.read_byte(0xFE00 + index + 1) as i32 - 8;
-                let tile_location = mem.read_byte(0xFE00 + index + 2);
-                let attributes = mem.read_byte(0xFE00 + index + 3);
-
-                let y_flip = attributes & (1 << 6) != 0;
-                let x_flip = attributes & (1 << 5) != 0;
-
-                let scanline = mem.read_byte(CURRENT_SCANLINE) as i32;
-                let mut y_size = 8;
-
-                if use8x16 {
-                    y_size = 16;
-                }
-
-                if (scanline >= y_pos) && (scanline < (y_pos + y_size)) {
-                    let mut line = scanline - y_pos;
-
-                    if y_flip {
-                        line -= y_size;
-                        line *= -1;
-                    }
-
-                    line *= 2;
-                    let data1 =
-                        mem.read_byte((0x8000 + (tile_location as Word * 16)) + line as Word);
-                    let data2 =
-                        mem.read_byte((0x8000 + (tile_location as Word * 16)) + line as Word + 1);
-
-                    for tile_pixel in (0..=7).rev() {
-                        let mut color_bit = tile_pixel;
-
-                        if x_flip {
-                            color_bit -= 7;
-                            color_bit *= -1;
-                        }
-                        let color_num = (((data2 & (1 << color_bit)) >> color_bit) << 1)
-                            | ((data1 & (1 << color_bit)) >> color_bit);
-
-                        let addr = match attributes & (1 << 4) != 0 {
-                            true => 0xFF49,
-                            false => 0xFF48,
-                        };
-
-                        let color = mem.get_color(color_num, addr).unwrap_or(Color::Black);
-
-                        if color == Color::White {
-                            continue;
-                        }
-
-                        let red;
-                        let blue;
-                        let green;
-
-                        match color {
-                            Color::White => {
-                                red = 255;
-                                green = 255;
-                                blue = 255;
-                            }
-                            Color::LightGrey => {
-                                red = 0xCC;
-                                green = 0xCC;
-                                blue = 0xCC;
-                            }
-                            Color::DarkGrey => {
-                                red = 0x77;
-                                green = 0x77;
-                                blue = 0x77;
-                            }
-                            Color::Black => {
-                                red = 0;
-                                green = 0;
-                                blue = 0;
-                            }
-                        }
-
-                        let x_pix = 7 - tile_pixel;
-                        let pixel = x_pos + x_pix;
-
-                        if pixel < 0
-                            || pixel >= SCREEN_WIDTH as i32
-                            || scanline < 0
-                            || scanline >= SCREEN_HEIGHT as i32
-                        {
-                            continue;
-                        }
-
-                        if attributes & (1 << 7) != 0 {
-                            continue; // TODO: Add packground handling
-                        }
-
-                        let idx = (scanline as usize * SCREEN_WIDTH as usize + pixel as usize) * 4;
-                        self.buffer[idx..idx + 4].copy_from_slice(&[red, green, blue, 255]);
-                    }
-                }
-            }
-        }
+    fn dmg_color(palette: u8, color: u8) -> [u8; 4] {
+        let value = [255, 0xCC, 0x77, 0][((palette >> (color * 2)) & 3) as usize];
+        [value, value, value, 255]
     }
 
     fn set_lcd_status(&mut self, mem: &mut Memory) {
-        let lcd_enabled = self.is_lcd_enabled(mem);
-
-        let mut status = mem.read_byte(LCD_STATUS);
-
-        // Behavior when lcd is disabled
-        if !lcd_enabled {
-            // sets the mode to 1 when the lcd is disabled and resets the scanline
-            self.scanline_counter = 456;
-            mem.write_byte_forced(CURRENT_SCANLINE, 0); // resets scanline
-
-            status &= 0xFC;
-            status |= 0x1;
-            mem.write_byte(LCD_STATUS, status);
-            return;
-        }
-
-        let current_line = mem.read_byte(CURRENT_SCANLINE);
-        let current_mode = status & 0x3;
-
-        let mode;
-        let mut require_interrupt = false;
-
-        // in vblank so mode is set to 1
-        if current_line >= 144 {
-            mode = 1;
-            status |= 0x1;
-            status &= !0x2;
-            require_interrupt = status & (1 << 4) != 0;
-        }
-        // mode 2
-        else if self.scanline_counter >= MODE_2_BOUNDS {
-            mode = 2;
-            status |= 0x2;
-            status &= !0x1;
-            require_interrupt = status & (1 << 5) != 0;
-        }
-        // mode 3
-        else if self.scanline_counter >= MODE_3_BOUNDS {
-            mode = 3;
-            status |= 0x3;
-        }
-        // mode 0
-        else {
-            mode = 0;
-            status &= !0x3;
-            require_interrupt = status & (1 << 3) != 0;
-        }
-
-        // we have no entered a new mode
-        if require_interrupt && (mode != current_mode) {
-            mem.request_interrupt(1);
-        }
-
-        // check the conicidence flag
-        if current_line == mem.read_byte(COINCIDENCE_FLAG) {
-            status |= 0x4;
-            if status & (1 << 6) != 0 {
-                mem.request_interrupt(1);
-            }
-        } else {
-            status &= !0x4;
-        }
-
-        // Write the new status
-        mem.write_byte(LCD_STATUS, status);
+        let line = mem.read_byte(CURRENT_SCANLINE);
+        let enabled = self.is_lcd_enabled(mem);
+        let mode = if !enabled { 0 } else if line >= 144 { 1 } else if self.dots < 80 { 2 }
+            else if self.dots < 252 { 3 } else { 0 };
+        let old = mem.read_byte(LCD_STATUS);
+        let coincidence = line == mem.read_byte(COINCIDENCE_FLAG);
+        let status = (old & 0x78) | 0x80 | mode | if coincidence { 4 } else { 0 };
+        mem.write_byte_forced(LCD_STATUS, status);
+        let irq = enabled && ((mode == 0 && status & 8 != 0) || (mode == 1 && status & 0x10 != 0)
+            || (mode == 2 && status & 0x20 != 0) || (coincidence && status & 0x40 != 0));
+        if irq && !self.stat_line { mem.request_interrupt(1); }
+        self.stat_line = irq;
     }
 
-    fn is_lcd_enabled(&self, mem: &Memory) -> bool {
-        // Check bit 7 of LCD Control register (0xFF40)
-        mem.read_byte(LCD_CONTROL) & (1 << 7) != 0
-    }
-
-    // TODO: Add more methods for drawing, sprites, etc.
+    fn is_lcd_enabled(&self, mem: &Memory) -> bool { mem.read_byte(LCD_CONTROL) & 0x80 != 0 }
 }
 
 #[cfg(test)]

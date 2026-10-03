@@ -30,21 +30,34 @@ pub const MODE_3_BOUNDS: i32 = MODE_2_BOUNDS - 172;
 pub const INPUT_REGISTER: Word = 0xFF00;
 
 #[derive(Debug)]
+/// One control on the Game Boy joypad.
 pub enum GameInput {
+    /// D-pad up.
     Up,
+    /// D-pad left.
     Left,
+    /// D-pad right.
     Right,
+    /// D-pad down.
     Down,
+    /// Start button.
     Start,
+    /// Select button.
     Select,
+    /// A button.
     A,
+    /// B button.
     B,
+    /// Unmapped input, ignored by the joypad.
     Unknown,
 }
 
 #[derive(Copy, Clone, Default)]
+/// Whether a joypad control is held or released.
 pub enum KeyState {
+    /// The control is held down.
     Pressed = 0,
+    /// The control is released.
     #[default]
     Released = 1,
 }
@@ -59,7 +72,8 @@ pub enum Color {
 
 /// RAM  Device Memory
 pub const MEM_SIZE: usize = 0x10000;
-pub const MAX_ROM_SIZE: usize = 0x80000; // 512 KiB
+/// Maximum cartridge ROM size: the MBC5 controller addresses up to 8 MiB.
+pub const MAX_ROM_SIZE: usize = 8 * 1024 * 1024;
 
 //Likely at some point will switch the RAM and ROM to be part of the Emulator struct
 
@@ -67,6 +81,7 @@ pub const MAX_ROM_SIZE: usize = 0x80000; // 512 KiB
 pub enum RomBankingType {
     MBC1,
     MBC2,
+    MBC5,
     None,
 }
 

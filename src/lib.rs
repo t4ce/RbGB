@@ -36,3 +36,6 @@ pub mod emulator;
 mod types;
 
 pub use emulator::*;
+extern crate alloc;
+
+pub use types::{GameInput, KeyState, MAX_ROM_SIZE};

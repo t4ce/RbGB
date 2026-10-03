@@ -1,15 +1,23 @@
+use alloc::{vec, vec::Vec};
 use core::ops::BitAnd;
 
 /// Functions and storage for operating on device memory
 use crate::types::*;
+use super::{cgb::Cgb, sound::Sound};
 
 pub struct Memory {
     mem: Ram,
-    rom: [Byte; MAX_ROM_SIZE],
+    rom: Vec<Byte>,
     rom_len: usize,
-    external_ram: [[Byte; 0x2000]; 4],
+    external_ram: Vec<[Byte; 0x2000]>,
+    cgb: Option<Cgb>,
+    pub sound: Sound,
+    dma_cycles: u32,
     rom_banking_type: RomBankingType,
     rom_banks: CurrentRomBank,
+    mbc5_rom_bank: u16,
+    mbc5_ram_bank: u8,
+    mbc5_rumble: bool,
     ram_banks: CurrentRamBank,
     ram_write_enable: bool,
     rom_bank_enable: bool,
@@ -29,11 +37,17 @@ impl Memory {
     pub fn new() -> Self {
         Memory {
             mem: [0; MEM_SIZE],
-            rom: [0; MAX_ROM_SIZE],
+            rom: Vec::new(),
             rom_len: 0,
-            external_ram: [[0; 0x2000]; 4],
+            external_ram: vec![[0; 0x2000]; 4],
+            cgb: None,
+            sound: Sound::new(),
+            dma_cycles: 0,
             rom_banking_type: RomBankingType::None,
             rom_banks: CurrentRomBank::Bank(1),
+            mbc5_rom_bank: 1,
+            mbc5_ram_bank: 0,
+            mbc5_rumble: false,
             ram_banks: CurrentRamBank::Bank0,
             ram_write_enable: false,
             rom_bank_enable: true,
@@ -53,6 +67,34 @@ impl Memory {
     ///
     /// Contains restrictions on what addresses can be written to, and deals with memory mapped regions
     pub fn write_byte(&mut self, addr: Word, value: Byte) {
+        if (0x8000..0xA000).contains(&addr) {
+            if let Some(cgb) = self.cgb.as_mut() {
+                if cgb.vram_bank != 0 {
+                    cgb.vram[(addr - 0x8000) as usize] = value;
+                    return;
+                }
+            }
+        }
+        if (0xD000..0xE000).contains(&addr) {
+            if let Some(cgb) = self.cgb.as_mut() {
+                let bank = cgb.wram_bank.max(1) as usize - 1;
+                cgb.wram[bank * 0x1000 + (addr - 0xD000) as usize] = value;
+                return;
+            }
+        }
+        if (0xFF10..=0xFF3F).contains(&addr) {
+            self.sound.write_register(addr, value);
+            return;
+        }
+        if addr == 0xFF55 && self.cgb.is_some() {
+            self.start_vram_dma(value);
+            return;
+        }
+        if let Some(cgb) = self.cgb.as_mut() {
+            if cgb.write_register(addr, value) {
+                return;
+            }
+        }
         // this is read only memory and should not be written to
         if addr < 0x8000 {
             self.handle_banking(addr, value);
@@ -61,8 +103,10 @@ impl Memory {
         else if (0xA000..0xC000).contains(&addr) {
             if self.ram_write_enable {
                 let offset = (addr - 0xA000) as usize;
-                let bank = self.ram_banks as usize;
-                self.external_ram[bank][offset] = value;
+                let bank = self.external_ram_bank();
+                if let Some(ram) = self.external_ram.get_mut(bank) {
+                    ram[offset] = value;
+                }
             }
         }
         // echo ram writes to two locations
@@ -106,15 +150,18 @@ impl Memory {
         if addr < 0x8000 {
             let index = addr as usize;
             if index < MAX_ROM_SIZE {
-                self.rom[index] = value;
                 if self.rom_len <= index {
+                    self.rom.resize(index + 1, 0);
                     self.rom_len = index + 1;
                 }
+                self.rom[index] = value;
             }
         } else if (0xA000..=0xBFFF).contains(&addr) {
             let offset = (addr - 0xA000) as usize;
-            let bank = self.ram_banks as usize;
-            self.external_ram[bank][offset] = value;
+            let bank = self.external_ram_bank();
+            if let Some(ram) = self.external_ram.get_mut(bank) {
+                ram[offset] = value;
+            }
         }
         //Sets byte
         self.mem[addr as usize] = value;
@@ -164,6 +211,23 @@ impl Memory {
     }
 
     fn handle_banking(&mut self, addr: Word, value: Byte) {
+        if self.rom_banking_type == RomBankingType::MBC5 {
+            match addr {
+                0x0000..=0x1FFF => self.ram_write_enable = value & 0x0F == 0x0A,
+                0x2000..=0x2FFF => {
+                    self.mbc5_rom_bank = (self.mbc5_rom_bank & 0x100) | u16::from(value);
+                }
+                0x3000..=0x3FFF => {
+                    self.mbc5_rom_bank = (self.mbc5_rom_bank & 0xFF) | (u16::from(value & 1) << 8);
+                }
+                0x4000..=0x5FFF => {
+                    // Rumble cartridges use bit 3 for the motor, not SRAM.
+                    self.mbc5_ram_bank = value & if self.mbc5_rumble { 7 } else { 15 };
+                }
+                _ => {}
+            }
+            return;
+        }
         // Performs a ram bank change
         if addr < 0x2000 {
             if self.rom_banking_type != RomBankingType::None {
@@ -291,14 +355,18 @@ impl Memory {
         self.mem[0xFF4A] = 0x00;
         self.mem[0xFF4B] = 0x00;
         self.mem[0xFFFF] = 0x00;
+        self.sound = Sound::new();
         self.refresh_rom_banking_type();
     }
 
     /// Checks to get the current rom banking type
     pub fn refresh_rom_banking_type(&mut self) {
-        match self.read_byte_forced(0x147) {
+        let cartridge_type = self.read_byte_forced(0x147);
+        self.mbc5_rumble = matches!(cartridge_type, 0x1C..=0x1E);
+        match cartridge_type {
             1..=3 => self.rom_banking_type = RomBankingType::MBC1,
             5..=6 => self.rom_banking_type = RomBankingType::MBC2,
+            0x19..=0x1E => self.rom_banking_type = RomBankingType::MBC5,
             _ => self.rom_banking_type = RomBankingType::None,
         }
     }
@@ -319,20 +387,53 @@ impl Memory {
     /// Loads the given ROM bytes into memory
     pub fn load_rom_data(&mut self, data: &[u8]) {
         self.mem.fill(0); // clear VRAM, WRAM, OAM, I/O mirrors
-        self.rom.fill(0);
+        self.cgb = data.get(0x143).filter(|flag| **flag & 0x80 != 0).map(|_| Cgb::new());
+        self.dma_cycles = 0;
         let copy_len = core::cmp::min(data.len(), MAX_ROM_SIZE);
-        self.rom[..copy_len].copy_from_slice(&data[..copy_len]);
+        self.rom.clear();
+        self.rom.extend_from_slice(&data[..copy_len]);
         self.rom_len = copy_len;
-        self.external_ram = [[0; 0x2000]; 4];
 
         self.rom_banks = CurrentRomBank::Bank(1);
+        self.mbc5_rom_bank = 1;
+        self.mbc5_ram_bank = 0;
         self.ram_banks = CurrentRamBank::Bank0;
         self.rom_bank_enable = true;
         self.ram_write_enable = false;
         self.refresh_rom_banking_type();
+        let ram_banks = if self.rom_banking_type == RomBankingType::MBC5 {
+            match data.get(0x149).copied().unwrap_or(0) {
+                2 => 1,
+                3 => 4,
+                4 => 16,
+                5 => 8,
+                _ => 0,
+            }
+        } else {
+            4
+        };
+        self.external_ram = vec![[0; 0x2000]; ram_banks];
     }
 
     fn read_byte_internal(&self, addr: Word) -> Byte {
+        if (0xE000..0xFE00).contains(&addr) {
+            return self.read_byte_internal(addr - 0x2000);
+        }
+        if (0xFF10..=0xFF3F).contains(&addr) {
+            return self.sound.read_register(addr);
+        }
+        if let Some(cgb) = self.cgb.as_ref() {
+            if (0x8000..0xA000).contains(&addr) && cgb.vram_bank != 0 {
+                return cgb.vram[(addr - 0x8000) as usize];
+            }
+            if (0xD000..0xE000).contains(&addr) {
+                let bank = cgb.wram_bank.max(1) as usize - 1;
+                return cgb.wram[bank * 0x1000 + (addr - 0xD000) as usize];
+            }
+            if let Some(value) = cgb.read_register(addr) {
+                return value;
+            }
+        }
         // read from the always consistant rom bank
         if addr < 0x4000 {
             return self.read_rom_byte(addr as usize);
@@ -341,18 +442,109 @@ impl Memory {
         // map to rom banking
         if (0x4000..=0x7FFF).contains(&addr) {
             let relative = (addr - 0x4000) as usize;
-            let offset = (self.rom_banks.value() as usize) * 0x4000;
+            let bank = if self.rom_banking_type == RomBankingType::MBC5 {
+                self.mbc5_rom_bank as usize
+            } else {
+                self.rom_banks.value() as usize
+            };
+            let offset = bank * 0x4000;
             return self.read_rom_byte(offset + relative);
         }
 
         // map to ram banking
         if (0xA000..=0xBFFF).contains(&addr) {
+            if self.rom_banking_type == RomBankingType::MBC5 && !self.ram_write_enable {
+                return 0xFF;
+            }
             let offset = (addr - 0xA000) as usize;
-            let bank = self.ram_banks as usize;
-            return self.external_ram[bank][offset];
+            let bank = self.external_ram_bank();
+            return self.external_ram.get(bank).map_or(0xFF, |ram| ram[offset]);
         }
 
         self.mem[addr as usize]
+    }
+
+    fn external_ram_bank(&self) -> usize {
+        let bank = if self.rom_banking_type == RomBankingType::MBC5 {
+            self.mbc5_ram_bank as usize
+        } else {
+            self.ram_banks as usize
+        };
+        bank % self.external_ram.len().max(1)
+    }
+
+    pub fn cgb_mode(&self) -> bool {
+        self.cgb.is_some()
+    }
+
+    pub fn double_speed(&self) -> bool {
+        self.cgb.as_ref().is_some_and(|cgb| cgb.key1 & 0x80 != 0)
+    }
+
+    pub fn switch_speed(&mut self) {
+        if let Some(cgb) = self.cgb.as_mut() {
+            if cgb.key1 & 1 != 0 {
+                cgb.key1 = (cgb.key1 ^ 0x80) & 0x80;
+                self.mem[DIVIDER_REGISTER as usize] = 0;
+            }
+        }
+    }
+
+    /// PPU reads are independent of the CPU's selected VRAM bank.
+    pub fn read_vram(&self, addr: Word, bank: u8) -> Byte {
+        if bank != 0 {
+            if let Some(cgb) = self.cgb.as_ref() {
+                return cgb.vram[(addr - 0x8000) as usize];
+            }
+        }
+        self.mem[addr as usize]
+    }
+
+    pub fn cgb_color(&self, object: bool, palette: u8, color: u8) -> [u8; 4] {
+        self.cgb.as_ref().map_or([255; 4], |cgb| cgb.color(object, palette, color))
+    }
+
+    fn start_vram_dma(&mut self, value: u8) {
+        let cgb = self.cgb.as_mut().unwrap();
+        if cgb.dma_active && value & 0x80 == 0 {
+            cgb.dma_active = false;
+            return;
+        }
+        cgb.dma_blocks = (value & 0x7F) + 1;
+        cgb.dma_active = value & 0x80 != 0 && self.mem[LCD_CONTROL as usize] & 0x80 != 0;
+        if !cgb.dma_active {
+            while self.cgb.as_ref().unwrap().dma_blocks != 0 {
+                self.vram_dma_block();
+            }
+        }
+    }
+
+    pub fn hblank_dma(&mut self) {
+        if self.cgb.as_ref().is_some_and(|cgb| cgb.dma_active) {
+            self.vram_dma_block();
+        }
+    }
+
+    fn vram_dma_block(&mut self) {
+        let cgb = self.cgb.as_ref().unwrap();
+        let source = cgb.dma_source;
+        let dest = 0x8000 | cgb.dma_dest;
+        for offset in 0..16 {
+            let byte = self.read_byte_internal(source.wrapping_add(offset));
+            self.write_byte(dest + offset, byte);
+        }
+        self.dma_cycles += if self.double_speed() { 64 } else { 32 };
+        let cgb = self.cgb.as_mut().unwrap();
+        cgb.dma_source = source.wrapping_add(16);
+        cgb.dma_dest = (cgb.dma_dest + 16) & 0x1FFF;
+        cgb.dma_blocks -= 1;
+        if cgb.dma_blocks == 0 {
+            cgb.dma_active = false;
+        }
+    }
+
+    pub fn take_dma_cycles(&mut self) -> u32 {
+        core::mem::take(&mut self.dma_cycles)
     }
 
     fn recompute_joypad(&mut self) {
