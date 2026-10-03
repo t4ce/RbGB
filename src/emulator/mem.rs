@@ -356,6 +356,7 @@ impl Memory {
         self.mem[0xFF4B] = 0x00;
         self.mem[0xFFFF] = 0x00;
         self.sound = Sound::new();
+        self.sound.set_cgb_mode(self.cgb_mode());
         self.refresh_rom_banking_type();
     }
 

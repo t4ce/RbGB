@@ -4,6 +4,7 @@ extern crate alloc;
 
 mod audio;
 mod commands;
+mod pacing;
 mod view;
 
 use alloc::{format, string::String};
@@ -16,8 +17,6 @@ use trueos::ui4_scene::{
 use trueos::{async_fs, clock, env, logl, vshell, vsys};
 use view::{HEIGHT, View, WIDTH};
 
-// Native LCD cadence (59.7275 Hz), also keeps 48 kHz PCM in time.
-const FRAME_NS: u64 = (70224 * 1_000_000_000 + 2_097_152) / 4_194_304;
 const SPRITE_ID: u32 = 1;
 
 fn main() {
@@ -54,24 +53,29 @@ fn run() -> Result<(), String> {
     ));
     print_controls();
     let mut shell = LineInput::new();
-    let mut uploaded = false;
+    let mut presenter = Presenter::new();
     let mut pending_resize = None;
     let mut audio = audio::AudioOutput::new();
-    let mut deadline = clock::monotonic_nanos();
+    let mut pacer = pacing::Pacer::new(clock::monotonic_nanos());
 
     loop {
         let loaded = poll_commands(&mut shell, &mut emulator, &directory);
         if loaded {
             audio.reset();
+            pacer.reset(clock::monotonic_nanos());
+            presenter.dirty = true;
         }
         let ui_work = (|| {
             while let Some(event) = frame.take_resize_event()? {
                 // A native pixel is the minimum; never crop or shrink the LCD.
                 pending_resize = Some((event.width.max(WIDTH), event.height.max(HEIGHT)));
             }
-            if let Some((width, height)) = pending_resize {
+            if let Some((width, height)) = pending_resize.filter(|_| presenter.can_resize()) {
                 match frame.resize(width, height) {
-                    Ok(()) => pending_resize = None,
+                    Ok(()) => {
+                        pending_resize = None;
+                        presenter.dirty = true;
+                    }
                     Err(Ui4Error::Busy) => {}
                     Err(error) => return Err(error),
                 }
@@ -91,30 +95,44 @@ fn run() -> Result<(), String> {
         }
 
         let running = !emulator.is_paused();
-        emulator.update();
         audio.pump(&mut emulator);
-
-        if !uploaded || loaded || running {
-            if let Err(error) = retry_busy(|| {
-                frame.upload_sprite_rgba8(SPRITE_ID, WIDTH, HEIGHT, emulator.get_display_buffer())
-            }) {
-                return ui_result(error);
+        if running {
+            // Catch up the native clock without requiring a GPU publication
+            // for each frame. Pump between updates and retain all short writes.
+            for _ in 0..4 {
+                if !pacer.due(clock::monotonic_nanos()) {
+                    break;
+                }
+                // Leave room for one LCD frame plus the largest DMA overshoot.
+                // Backpressure pauses production rather than dropping notes.
+                if emulator.audio_samples().len() / 2 > 3200 {
+                    break;
+                }
+                emulator.update();
+                pacer.advance();
+                presenter.dirty = true;
+                audio.pump(&mut emulator);
             }
-            uploaded = true;
+        } else {
+            pacer.reset(clock::monotonic_nanos());
+            pacer.advance();
         }
-        if let Err(error) = present(&mut frame) {
+        if let Err(error) = presenter.advance(&mut frame, emulator.get_display_buffer()) {
             return ui_result(error);
         }
 
         vsys::poll_once();
-        deadline = deadline.saturating_add(FRAME_NS);
-        let now = clock::monotonic_nanos();
-        if now > deadline.saturating_add(FRAME_NS) {
-            deadline = now;
-        }
-        let remaining = deadline.saturating_sub(now);
+        let remaining = pacer.wait_ns(clock::monotonic_nanos());
         if remaining > 0 {
-            vsys::sleep_ms(remaining.div_ceil(1_000_000));
+            let wait_ms = remaining.div_ceil(1_000_000);
+            vsys::sleep_ms(if presenter.pending() {
+                wait_ms.min(1)
+            } else {
+                wait_ms
+            });
+        } else {
+            // Audio backpressure can temporarily leave the native clock due.
+            vsys::sleep_ms(1);
         }
     }
 }
@@ -128,7 +146,7 @@ fn ui_result(error: Ui4Error) -> Result<(), String> {
     }
 }
 
-fn present(frame: &mut Frame) -> Result<(), Ui4Error> {
+fn screen_quad(frame: &Frame) -> SpriteQuad {
     let view = View::fit(frame.width(), frame.height());
     let corner = |x, y, u, v| SpriteCorner {
         x: x as f32,
@@ -136,7 +154,7 @@ fn present(frame: &mut Frame) -> Result<(), Ui4Error> {
         u,
         v,
     };
-    let quad = SpriteQuad {
+    SpriteQuad {
         sprite_id: SPRITE_ID,
         c0: corner(view.x, view.y, 0.0, 0.0),
         c1: corner(view.x + view.width, view.y, 1.0, 0.0),
@@ -144,10 +162,75 @@ fn present(frame: &mut Frame) -> Result<(), Ui4Error> {
         c3: corner(view.x, view.y + view.height, 0.0, 1.0),
         color_rgba: rgba(255, 255, 255, 255),
         source_over: false,
-    };
-    retry_busy(|| frame.begin_sprite_frame(rgba(0, 0, 0, 0)))?;
-    retry_busy(|| frame.draw_sprite_quads(core::slice::from_ref(&quad)))?;
-    retry_busy(|| frame.publish_compute(Damage::full(frame.width(), frame.height())))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PresentStage {
+    Upload,
+    Begin,
+    Draw,
+    Publish,
+}
+
+struct Presenter {
+    stage: PresentStage,
+    dirty: bool,
+}
+
+impl Presenter {
+    fn new() -> Self {
+        Self {
+            stage: PresentStage::Upload,
+            dirty: true,
+        }
+    }
+
+    fn can_resize(&self) -> bool {
+        matches!(self.stage, PresentStage::Upload)
+    }
+
+    fn pending(&self) -> bool {
+        !self.can_resize() || self.dirty
+    }
+
+    fn advance(&mut self, frame: &mut Frame, pixels: &[u8]) -> Result<(), Ui4Error> {
+        // Busy retains the current lease/stage and returns to the audio loop.
+        // A warm sprite is updated only after the preceding frame is published.
+        for _ in 0..4 {
+            let result = match self.stage {
+                PresentStage::Upload => {
+                    if !self.dirty {
+                        return Ok(());
+                    }
+                    frame.upload_sprite_rgba8(SPRITE_ID, WIDTH, HEIGHT, pixels)
+                }
+                PresentStage::Begin => frame.begin_sprite_frame(rgba(0, 0, 0, 0)),
+                PresentStage::Draw => frame.draw_sprite_quads(&[screen_quad(frame)]),
+                PresentStage::Publish => {
+                    frame.publish_compute(Damage::full(frame.width(), frame.height()))
+                }
+            };
+            match result {
+                Err(Ui4Error::Busy) => return Ok(()),
+                Err(error) => return Err(error),
+                Ok(()) => {}
+            }
+            self.stage = match self.stage {
+                PresentStage::Upload => {
+                    self.dirty = false;
+                    PresentStage::Begin
+                }
+                PresentStage::Begin => PresentStage::Draw,
+                PresentStage::Draw => PresentStage::Publish,
+                PresentStage::Publish => {
+                    self.stage = PresentStage::Upload;
+                    return Ok(());
+                }
+            };
+        }
+        Ok(())
+    }
 }
 
 fn apply_keyboard(emulator: &mut Emulator, keyboard: Option<&KeyboardState>) {
@@ -266,16 +349,4 @@ fn poll_commands(shell: &mut LineInput, emulator: &mut Emulator, directory: &str
         }
     }
     loaded
-}
-
-fn retry_busy(mut operation: impl FnMut() -> Result<(), Ui4Error>) -> Result<(), Ui4Error> {
-    loop {
-        match operation() {
-            Err(Ui4Error::Busy) => {
-                vsys::poll_once();
-                vsys::sleep_ms(1);
-            }
-            result => return result,
-        }
-    }
 }

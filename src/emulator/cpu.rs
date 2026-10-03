@@ -2616,8 +2616,16 @@ impl Timer {
         if Self::is_clock_enabled(mem) {
             mem.timer_counter -= cycles;
 
-            if mem.timer_counter <= 0 {
-                mem.set_clock_frequency();
+            while mem.timer_counter <= 0 {
+                // Carry instruction/DMA overshoot into the next tick instead
+                // of discarding it. A DMA stall may span many timer periods.
+                let period = match mem.get_clock_freq() {
+                    0 => 1024,
+                    1 => 16,
+                    2 => 64,
+                    _ => 256,
+                };
+                mem.timer_counter += period;
 
                 if mem.read_byte(TIMA) == 255 {
                     let tma_val = mem.read_byte(TMA);
@@ -2633,8 +2641,8 @@ impl Timer {
 
     fn do_divider_registers(&mut self, mem: &mut Memory, cycles: i32) {
         self.divider_counter += cycles as u32;
-        if self.divider_counter >= 255 {
-            self.divider_counter = 0;
+        while self.divider_counter >= 256 {
+            self.divider_counter -= 256;
             let divider_register = mem.read_byte_forced(DIVIDER_REGISTER).wrapping_add(1);
             mem.write_byte_forced(DIVIDER_REGISTER, divider_register);
         }
