@@ -5,16 +5,18 @@ use crate::types::*;
 pub struct Screen {
     scanline_counter: i32,
 
-    //buffer is of size (h * w * 3)
-    //buffer can be indexed as (h + (w*3))
-    pub buffer: LCD, // Each pixel is a byte (0-3 for Game Boy palettes)
+    // Packed, row-major RGBA8; every pixel has opaque alpha.
+    pub buffer: LCD,
 }
 
 impl Screen {
     pub fn new() -> Self {
-        // TODO: Initialize the screen buffer
+        let mut buffer = [0; (SCREEN_HEIGHT * SCREEN_WIDTH * 4) as usize];
+        for pixel in buffer.chunks_exact_mut(4) {
+            pixel[3] = 255;
+        }
         Screen {
-            buffer: [0; (SCREEN_HEIGHT * SCREEN_WIDTH * 3) as usize],
+            buffer,
 
             scanline_counter: 456,
         }
@@ -142,10 +144,8 @@ impl Screen {
                 continue;
             }
 
-            let idx = (current_line as usize * SCREEN_WIDTH as usize + pixel as usize) * 3;
-            self.buffer[idx] = red;
-            self.buffer[idx + 1] = green;
-            self.buffer[idx + 2] = blue;
+            let idx = (current_line as usize * SCREEN_WIDTH as usize + pixel as usize) * 4;
+            self.buffer[idx..idx + 4].copy_from_slice(&[red, green, blue, 255]);
         }
     }
 
@@ -251,10 +251,8 @@ impl Screen {
                             continue; // TODO: Add packground handling
                         }
 
-                        let idx = (scanline as usize * SCREEN_WIDTH as usize + pixel as usize) * 3;
-                        self.buffer[idx] = red;
-                        self.buffer[idx + 1] = green;
-                        self.buffer[idx + 2] = blue;
+                        let idx = (scanline as usize * SCREEN_WIDTH as usize + pixel as usize) * 4;
+                        self.buffer[idx..idx + 4].copy_from_slice(&[red, green, blue, 255]);
                     }
                 }
             }
@@ -373,8 +371,9 @@ mod test {
 
         screen.render_tiles(&mem, 0x31);
 
-        let correct = (SCREEN_WIDTH as usize) * 3;
-        assert_eq!(screen.buffer[correct], 255);
+        let correct = (SCREEN_WIDTH as usize) * 4;
+        assert_eq!(&screen.buffer[correct..correct + 4], &[255, 255, 255, 255]);
         assert_eq!(screen.buffer[1], 0);
+        assert!(screen.buffer.chunks_exact(4).all(|pixel| pixel[3] == 255));
     }
 }

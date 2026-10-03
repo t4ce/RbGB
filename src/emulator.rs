@@ -117,8 +117,8 @@ impl Emulator {
 
     /// Borrow the current display buffer for rendering.
     ///
-    /// The buffer contains raw pixel data produced by the graphics subsystem.
-    /// Its length and format are determined by `graphics::Screen`.
+    /// The buffer is a tightly packed 160 x 144 RGBA8 image in row-major order
+    /// (92,160 bytes). Each pixel contains red, green, blue, then alpha (255).
     ///
     /// Returns a borrowed `&[u8]` slice tied to the emulator's lifetime.
     pub fn get_display_buffer(&self) -> &[u8] {

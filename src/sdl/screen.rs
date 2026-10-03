@@ -57,10 +57,10 @@ impl SdlApp {
     }
 
     pub fn run(&mut self, emulator: &mut Emulator) -> Result<(), String> {
-        // Create the streaming texture once per run so we can push raw RGB data to it
+        // Create the streaming texture once per run for packed RGBA bytes.
         let texture_creator = self.canvas.texture_creator();
         let mut texture = texture_creator
-            .create_texture_streaming(PixelFormatEnum::RGB24, SCREEN_WIDTH, SCREEN_HEIGHT)
+            .create_texture_streaming(PixelFormatEnum::RGBA32, SCREEN_WIDTH, SCREEN_HEIGHT)
             .map_err(|e| e.to_string())?;
 
         'running: loop {
@@ -75,7 +75,7 @@ impl SdlApp {
 
             // Advance the emulator state, copy the LCD buffer into SDL, then render
             emulator.update();
-            Self::blit_rgb_bytes_to_texture(emulator, &mut texture)?;
+            Self::blit_rgba_bytes_to_texture(emulator, &mut texture)?;
 
             self.draw(emulator.is_paused(), &texture)?;
             self.limit_frame_rate(frame_start);
@@ -161,12 +161,12 @@ impl SdlApp {
         Ok(())
     }
 
-    fn blit_rgb_bytes_to_texture(
+    fn blit_rgba_bytes_to_texture(
         emulator: &Emulator,
         texture: &mut Texture,
     ) -> Result<(), String> {
         let data = emulator.get_display_buffer();
-        let pitch = (SCREEN_WIDTH * 3) as usize; // 3 bytes per pixel
+        let pitch = (SCREEN_WIDTH * 4) as usize; // 4 bytes per pixel
         let expected_len = pitch * SCREEN_HEIGHT as usize;
 
         if data.len() != expected_len {

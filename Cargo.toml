@@ -6,7 +6,6 @@ authors = ["Noah Graf <noah@grafhome.net>"]
 description = "A basic and rough gameboy emulator"
 license = "MIT"
 repository = "https://github.com/ngraf3255/RbGB"
-keywords = ["gamedev", "graphics", "emulator"]
 
 [lib]
 name = "rbgb"
@@ -15,19 +14,12 @@ path = "src/lib.rs"
 [[bin]]
 name = "rbgb"
 path = "src/main.rs"
-required-features = ["gui"]
+test = false
+bench = false
 
 [dependencies]
-sdl2 = { version = "0.37.0", optional = true }
+trueos = { workspace = true, features = ["ui4-scene"] }
 
 [features]
-default = ["std", "gui"]
+default = []
 std = []
-gui = ["std", "sdl2"]
-
-# Easiest to bundle on windows since theres not a super easy way to install
-[target.'cfg(windows)'.dependencies]
-sdl2 = { version = "0.37.0", features = ["bundled"], optional = true }
-
-[dev-dependencies]
-ntest = "0.9.3"
