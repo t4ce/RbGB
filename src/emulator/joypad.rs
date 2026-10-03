@@ -20,7 +20,9 @@ pub struct Joypad {
 
 impl Joypad {
     pub fn new() -> Self {
-        Joypad { ..Default::default() }
+        Joypad {
+            ..Default::default()
+        }
     }
 
     /// Takes the input and affects the associated memory value with what it should be

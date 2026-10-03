@@ -1,9 +1,9 @@
 use alloc::{vec, vec::Vec};
 use core::ops::BitAnd;
 
+use super::{cgb::Cgb, sound::Sound};
 /// Functions and storage for operating on device memory
 use crate::types::*;
-use super::{cgb::Cgb, sound::Sound};
 
 pub struct Memory {
     mem: Ram,
@@ -387,7 +387,10 @@ impl Memory {
     /// Loads the given ROM bytes into memory
     pub fn load_rom_data(&mut self, data: &[u8]) {
         self.mem.fill(0); // clear VRAM, WRAM, OAM, I/O mirrors
-        self.cgb = data.get(0x143).filter(|flag| **flag & 0x80 != 0).map(|_| Cgb::new());
+        self.cgb = data
+            .get(0x143)
+            .filter(|flag| **flag & 0x80 != 0)
+            .map(|_| Cgb::new());
         self.dma_cycles = 0;
         let copy_len = core::cmp::min(data.len(), MAX_ROM_SIZE);
         self.rom.clear();
@@ -501,7 +504,9 @@ impl Memory {
     }
 
     pub fn cgb_color(&self, object: bool, palette: u8, color: u8) -> [u8; 4] {
-        self.cgb.as_ref().map_or([255; 4], |cgb| cgb.color(object, palette, color))
+        self.cgb
+            .as_ref()
+            .map_or([255; 4], |cgb| cgb.color(object, palette, color))
     }
 
     fn start_vram_dma(&mut self, value: u8) {

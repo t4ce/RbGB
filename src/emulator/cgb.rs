@@ -89,10 +89,19 @@ impl Cgb {
     }
 
     pub fn color(&self, object: bool, palette: u8, color: u8) -> [u8; 4] {
-        let colors = if object { &self.obj_palette } else { &self.bg_palette };
+        let colors = if object {
+            &self.obj_palette
+        } else {
+            &self.bg_palette
+        };
         let index = usize::from(palette & 7) * 8 + usize::from(color & 3) * 2;
         let rgb = u16::from_le_bytes([colors[index], colors[index + 1]]);
         let expand = |v: u16| ((v << 3) | (v >> 2)) as u8;
-        [expand(rgb & 31), expand((rgb >> 5) & 31), expand((rgb >> 10) & 31), 255]
+        [
+            expand(rgb & 31),
+            expand((rgb >> 5) & 31),
+            expand((rgb >> 10) & 31),
+            255,
+        ]
     }
 }

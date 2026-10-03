@@ -40,9 +40,21 @@ impl CPU {
 
     pub fn reset(&mut self) {
         self.reg.reset();
+        if self.mmu.mem.cgb_mode() {
+            // CGB boot ROM handoff. A=0x11 identifies CGB hardware to games.
+            self.reg.a = 0x11;
+            self.reg.f = 0x80;
+            self.reg.b = 0;
+            self.reg.c = 0;
+            self.reg.d = 0xFF;
+            self.reg.e = 0x56;
+            self.reg.h = 0;
+            self.reg.l = 0x0D;
+        }
+        self.timers = Timer::new();
         self.halted = false;
         self.halt_bug = false;
-        self.ime = true;
+        self.ime = false;
         self.setdi = 0;
         self.setei = 0;
     }
@@ -95,7 +107,7 @@ impl CPU {
 
     fn fetchword(&mut self) -> u16 {
         let w = self.mmu.rw(self.reg.pc);
-        self.reg.pc += 2;
+        self.reg.pc = self.reg.pc.wrapping_add(2);
         w
     }
 
@@ -146,7 +158,7 @@ impl CPU {
         self.pushstack(pc);
         self.reg.pc = 0x0040 | ((n as u16) << 3);
 
-        4
+        5
     }
 
     fn pushstack(&mut self, value: u16) {
@@ -156,7 +168,7 @@ impl CPU {
 
     fn popstack(&mut self) -> u16 {
         let res = self.mmu.rw(self.reg.sp);
-        self.reg.sp += 2;
+        self.reg.sp = self.reg.sp.wrapping_add(2);
         res
     }
 
@@ -229,6 +241,7 @@ impl CPU {
                 1
             }
             0x10 => {
+                self.fetchbyte(); // STOP includes a padding byte.
                 self.mmu.switch_speed();
                 1
             } // STOP
@@ -660,8 +673,8 @@ impl CPU {
                 2
             }
             0x76 => {
-                self.halted = true;
-                self.halt_bug = (self.mmu.read_if() & self.mmu.read_ie() & 0x1F) != 0;
+                self.halt_bug = !self.ime && (self.mmu.read_if() & self.mmu.read_ie() & 0x1F) != 0;
+                self.halted = !self.halt_bug;
                 1
             }
             0x77 => {
@@ -2583,7 +2596,9 @@ impl MemoryAdapter {
         self.wb(IF, value);
     }
 
-    fn switch_speed(&self) {}
+    fn switch_speed(&mut self) {
+        self.mem.switch_speed();
+    }
 }
 
 pub struct Timer {

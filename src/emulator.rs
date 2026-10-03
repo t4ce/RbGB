@@ -1,7 +1,7 @@
 use crate::types::{GameInput, KeyState};
 
-mod cpu;
 mod cgb;
+mod cpu;
 mod graphics;
 mod joypad;
 mod mem;
@@ -20,6 +20,7 @@ pub struct Emulator {
     cpu: cpu::CPU,
     joypad: joypad::Joypad,
     paused: bool,
+    frame_dot_debt: u32,
 }
 
 impl Default for Emulator {
@@ -33,7 +34,7 @@ impl Emulator {
     ///
     /// This matches the approximate number of cycles a Game Boy runs in one
     /// video frame. The update loop runs until this budget is reached.
-    const MAXCYCLES: u32 = 69905;
+    const MAXCYCLES: u32 = 456 * 154;
 
     /// Create a new emulator instance with initialized subsystems.
     ///
@@ -49,6 +50,7 @@ impl Emulator {
             cpu,
             joypad: joypad::Joypad::new(),
             paused: true,
+            frame_dot_debt: 0,
         }
     }
 
@@ -62,15 +64,23 @@ impl Emulator {
         if self.paused {
             return;
         }
-        let mut num_cycles: u32 = 0;
-        while num_cycles < Self::MAXCYCLES {
-            let cycles = self.cpu.execute_next_opcode(false);
-            num_cycles += cycles as u32;
+        let mut dots = self.frame_dot_debt;
+        while dots < Self::MAXCYCLES {
+            let double_speed = self.cpu.memory_mut().double_speed();
+            let dma_cycles = self.cpu.memory_mut().take_dma_cycles();
+            let cycles = if dma_cycles != 0 {
+                dma_cycles
+            } else {
+                self.cpu.execute_next_opcode(false) as u32
+            };
+            let elapsed_dots = if double_speed { cycles / 2 } else { cycles };
+            dots += elapsed_dots;
             self.cpu.update_timers(cycles as i32);
             self.screen
-                .update_screen(self.cpu.memory_mut(), cycles as i32);
-            self.cpu.handle_interrupts();
+                .update_screen(self.cpu.memory_mut(), elapsed_dots as i32);
+            self.cpu.memory_mut().sound.step(elapsed_dots);
         }
+        self.frame_dot_debt = dots - Self::MAXCYCLES;
     }
 
     /// Toggle the paused state.
@@ -97,7 +107,25 @@ impl Emulator {
         mem.load_rom_data(data);
         mem.ram_startup();
         self.cpu.reset();
+        self.screen = graphics::Screen::new();
+        self.joypad = joypad::Joypad::new();
+        self.frame_dot_debt = 0;
         self.paused = false;
+    }
+
+    /// Whether the loaded cartridge runs in native Game Boy Color mode.
+    pub fn is_cgb(&mut self) -> bool {
+        self.cpu.memory_mut().cgb_mode()
+    }
+
+    /// Pending interleaved left/right signed 16-bit PCM at 48 kHz.
+    pub fn audio_samples(&mut self) -> &[i16] {
+        self.cpu.memory_mut().sound.samples()
+    }
+
+    /// Retire PCM frames accepted by the audio output, retaining short writes.
+    pub fn consume_audio_frames(&mut self, frames: usize) {
+        self.cpu.memory_mut().sound.consume_frames(frames);
     }
 
     #[cfg(feature = "std")]
