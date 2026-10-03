@@ -30,11 +30,8 @@ impl Default for Emulator {
 }
 
 impl Emulator {
-    /// Maximum CPU cycles executed per frame.
-    ///
-    /// This matches the approximate number of cycles a Game Boy runs in one
-    /// video frame. The update loop runs until this budget is reached.
-    const MAXCYCLES: u32 = 456 * 154;
+    /// Master-clock dots per LCD frame, independent of CPU speed.
+    const FRAME_DOTS: u32 = 456 * 154;
 
     /// Create a new emulator instance with initialized subsystems.
     ///
@@ -65,7 +62,7 @@ impl Emulator {
             return;
         }
         let mut dots = self.frame_dot_debt;
-        while dots < Self::MAXCYCLES {
+        while dots < Self::FRAME_DOTS {
             let double_speed = self.cpu.memory_mut().double_speed();
             let dma_cycles = self.cpu.memory_mut().take_dma_cycles();
             let cycles = if dma_cycles != 0 {
@@ -80,7 +77,7 @@ impl Emulator {
                 .update_screen(self.cpu.memory_mut(), elapsed_dots as i32);
             self.cpu.memory_mut().sound.step(elapsed_dots);
         }
-        self.frame_dot_debt = dots - Self::MAXCYCLES;
+        self.frame_dot_debt = dots - Self::FRAME_DOTS;
     }
 
     /// Toggle the paused state.
